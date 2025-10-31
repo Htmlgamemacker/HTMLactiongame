@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<title>マリオ風アクション ver.4.1 - もみじ山（高ジャンプ）</title>
+<style>
+  body { margin:0; background:linear-gradient(#ffd7b3,#ffeedd); overflow:hidden; }
+  canvas { display:block; margin:0 auto; background:transparent; }
+  #hint { position:fixed; left:10px; bottom:10px; color:#333; font-family:sans-serif; background:rgba(255,255,255,0.6); padding:6px 8px; border-radius:6px; }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540"></canvas>
+<div id="hint">← →: 移動　↑: ジャンプ（強化）　キノコで大きくなる</div>
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  // ---- constants / tuning ----
+  const W = canvas.width, H = canvas.height;
+  const GRAV = 0.6;            // gravity
+  const TERMINAL = 20;        // max falling speed
+  const SMALL_H = 48, BIG_H = 78;
+  const STAGE_LENGTH = 6000;  // long stage
+  const GROUND_Y = H - 80;
+
+  // ---- state ----
+  let keys = {};
+  let scrollX = 0;
+  let lives = 3;
+  let score = 0;
+  let gameClear = false;
+  let gameOver = false;
+  let flagAnim = { active:false, t:0 };
+
+  // ---- player ----
+  const player = {
+    x:120, y: GROUND_Y - SMALL_H,
+    w:36, h:SMALL_H,
+    vx:0, vy:0,
+    onGround:false,
+    big:false,
+    invincible:0
+  };
+
+  // ---- stage arrays ----
+  let groundTiles = [];
+  let blocks = []; // question/brick/empty/goal
+  let enemies = [];
+  let items = []; // mushrooms
+  let leaves = [];
+
+  // ---- init stage: floors, platforms, ? blocks, goal ----
+  function initStage(){
+    groundTiles = [];
+    for(let x=0;x<STAGE_LENGTH;x+=64){
+      groundTiles.push({x:x,y:GROUND_Y,w:64,h:80});
+    }
+
+    blocks = [];
+    function addPlatform(x, y, count=1, type='floor'){
+      for(let i=0;i<count;i++){
+        blocks.push({x:x+i*64, y:y, w:64, h:48, type:type, hit:false});
+      }
+    }
+
+    // start area (gentle slope)
+    addPlatform(400, GROUND_Y - 160, 3, 'floor');
+    addPlatform(700, GROUND_Y - 220, 1, 'floor');
+
+    // reachable ? blocks cluster (heights tuned for stronger jump)
+    const qBaseY = GROUND_Y - 240;
+    blocks.push({x:1000, y:qBaseY, w:64, h:48, type:'?' , hit:false});
+    blocks.push({x:1064, y:qBaseY, w:64, h:48, type:'?' , hit:false});
+    blocks.push({x:1128, y:qBaseY, w:64, h:48, type:'?' , hit:false});
+    blocks.push({x:1192, y:qBaseY, w:64, h:48, type:'?' , hit:false});
+
+    // mid-platform + more ? blocks
+    addPlatform(1500, GROUND_Y - 120, 3, 'floor');
+    blocks.push({x:1580, y:GROUND_Y - 200, w:64, h:48, type:'?' , hit:false});
+    blocks.push({x:1644, y:GROUND_Y - 200, w:64, h:48, type:'?' , hit:false});
+
+    // floating islands
+    addPlatform(2100, GROUND_Y - 260, 2, 'floor');
+    addPlatform(2400, GROUND_Y - 320, 1, 'floor');
+
+    // later readjusted area
+    blocks.push({x:3000, y:GROUND_Y - 200, w:64, h:48, type:'?' , hit:false});
+    blocks.push({x:3064, y:GROUND_Y - 200, w:64, h:48, type:'brick' , hit:false});
+    addPlatform(3300, GROUND_Y - 120, 4, 'floor');
+
+    // small boss-like zone near end
+    addPlatform(4200, GROUND_Y - 120, 6, 'floor');
+    blocks.push({x:4550, y:GROUND_Y - 180, w:64, h:48, type:'?' , hit:false});
+    // goal flag area
+    blocks.push({x: STAGE_LENGTH - 400, y: GROUND_Y - 220, w:64, h:48, type:'goal', hit:false});
+
+    // enemies spread
+    enemies = [
+      {x:900, y: GROUND_Y - 48, w:40, h:40, vx:-1.2},
+      {x:1700, y: GROUND_Y - 48, w:40, h:40, vx:1},
+      {x:2300, y: GROUND_Y - 48, w:40, h:40, vx:-0.8},
+      {x:2900, y: GROUND_Y - 48, w:40, h:40, vx:1.2},
+      {x:4400, y: GROUND_Y - 48, w:48, h:48, vx:-1}
+    ];
+  }
+
+  initStage();
+
+  // leaf background
+  function spawnLeaf(){
+    const lx = Math.random()*STAGE_LENGTH;
+    leaves.push({
+      x: lx,
+      y: Math.random()*120 + 20,
+      vx: (Math.random()*0.6 + 0.2)*(Math.random()<0.5?-1:1),
+      vy: Math.random()*0.3+0.1,
+      rot: Math.random()*Math.PI*2,
+      rotSpeed: (Math.random()-0.5)*0.05,
+      size: Math.random()*10+8,
+      life: 200 + Math.random()*200
+    });
+  }
+  for(let i=0;i<40;i++) spawnLeaf();
+
+  // input
+  document.addEventListener('keydown', e => { keys[e.key] = true; });
+  document.addEventListener('keyup', e => { keys[e.key] = false; });
+
+  // utilities
+  function rectInt(a,b){
+    return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+  }
+  function clamp(v, a, b){ return Math.max(a, Math.min(b, v)); }
+
+  // safe grow
+  function growPlayer(){
+    if(player.big) return;
+    const oldH = player.h;
+    const newH = BIG_H;
+    const dh = newH - oldH;
+    player.y -= dh; // keep feet
+    player.h = newH;
+    player.big = true;
+    // resolve overlap
+    for(let b of groundTiles.concat(blocks)){
+      if(rectInt(player, b)){
+        if(player.y + player.h/2 < b.y + b.h/2){
+          player.y = b.y + b.h;
+          player.vy = 0;
+        } else {
+          player.y = b.y - player.h;
+          player.vy = 0;
+          player.onGround = true;
+        }
+      }
+    }
+    if(player.y + player.h > H) player.y = H - player.h;
+  }
+
+  function spawnFromQuestion(b){
+    items.push({ x: b.x + 8, y: b.y - 40, w:28, h:28, vy:-3, vx:1.2, type:'mushroom' });
+  }
+
+  // main update
+  function update(){
+    if(gameOver || gameClear) return;
+
+    // controls: doubled jump strength (major change)
+    player.vx = 0;
+    if(keys['ArrowLeft']) player.vx = -4;
+    if(keys['ArrowRight']) player.vx = 4;
+    if(keys['ArrowUp'] && player.onGround){
+      // doubled jump: stronger initial upward velocity
+      player.vy = -20; // <- jump power increased ~2x (was -11)
+      player.onGround = false;
+    }
+
+    // physics
+    player.vy += GRAV;
+    // clamp terminal velocity
+    if(player.vy > TERMINAL) player.vy = TERMINAL;
+
+    player.x += player.vx;
+    player.y += player.vy;
+
+    // invincible tick
+    if(player.invincible>0) player.invincible--;
+
+    // --- vertical collision (landing & head hit) ---
+    player.onGround = false;
+    const solidList = groundTiles.concat(blocks);
+    for(let s of solidList){
+      if(player.x + player.w > s.x && player.x < s.x + s.w){
+        // landing
+        if(player.vy >= 0 && player.y + player.h > s.y && (player.y + player.h - player.vy) <= s.y){
+          player.y = s.y - player.h;
+          player.vy = 0;
+          player.onGround = true;
+        }
+        // head hit (player moving up)
+        else if(player.vy < 0 && player.y < s.y + s.h && (player.y - player.vy) >= s.y + s.h){
+          player.y = s.y + s.h;
+          player.vy = 0;
+          if(s.type === '?' && !s.hit){
+            s.hit = true;
+            spawnFromQuestion(s);
+          }
+        }
+      }
+    }
+
+    // horizontal collision
+    for(let s of solidList){
+      if(player.y + player.h > s.y && player.y < s.y + s.h){
+        if(player.x + player.w > s.x && player.x < s.x + s.w){
+          if(player.vx > 0) player.x = s.x - player.w;
+          else if(player.vx < 0) player.x = s.x + s.w;
+        }
+      }
+    }
+
+    // items (mushroom)
+    for(let it of items){
+      it.vy += 0.3;
+      it.x += it.vx || 0;
+      it.y += it.vy;
+      for(let s of solidList){
+        if(rectInt(it, s)){
+          it.y = s.y - it.h;
+          it.vy = 0;
+        }
+      }
+      if(player.x < it.x + it.w && player.x + player.w > it.x &&
+         player.y < it.y + it.h && player.y + player.h > it.y){
+        if(it.type === 'mushroom') growPlayer();
+        it.remove = true;
+      }
+      if(it.x < -200 || it.x > STAGE_LENGTH + 400) it.remove = true;
+    }
+    items = items.filter(it => !it.remove);
+
+    // enemies
+    for(let e of enemies){
+      e.x += e.vx;
+      for(let s of solidList){
+        if(e.y + e.h > s.y && e.y < s.y + s.h){
+          if(e.x + e.w > s.x && e.x < s.x + s.w){
+            e.vx *= -1;
+            if(e.vx > 0) e.x = s.x + s.w;
+            else e.x = s.x - e.w;
+          }
+        }
+      }
+      // collision with player
+      if(player.x < e.x + e.w && player.x + player.w > e.x &&
+         player.y < e.y + e.h && player.y + player.h > e.y){
+        if(player.vy > 0){ // stomp
+          e.dead = true;
+          player.vy = -7;
+          score += 150;
+        } else {
+          if(!player.big && player.invincible<=0){
+            lives--;
+            player.invincible = 60;
+            player.x = Math.max(100, player.x - 120);
+            if(lives <= 0) gameOver = true;
+          } else if(player.big && player.invincible<=0){
+            player.big = false;
+            player.h = SMALL_H;
+            player.invincible = 60;
+          }
+        }
+      }
+    }
+    enemies = enemies.filter(e => !e.dead);
+
+    // leaves update/spawn
+    for(let lf of leaves){
+      lf.x += lf.vx;
+      lf.y += lf.vy;
+      lf.rot += lf.rotSpeed;
+      lf.life--;
+      if(lf.x < -200) lf.x += STAGE_LENGTH + 400;
+      if(lf.x > STAGE_LENGTH + 200) lf.x -= STAGE_LENGTH + 400;
+    }
+    if(Math.random() < 0.03) spawnLeaf();
+
+    // scroll clamp
+    scrollX = clamp(player.x - 220, 0, STAGE_LENGTH - W);
+
+    // goal check
+    for(let b of blocks){
+      if(b.type === 'goal' && player.x + player.w > b.x){
+        gameClear = true;
+        flagAnim.active = true;
+        flagAnim.t = 0;
+      }
+    }
+
+    // falling off
+    if(player.y > H + 300){
+      lives--;
+      if(lives <= 0) gameOver = true;
+      else {
+        player.x = Math.max(100, player.x - 400);
+        player.y = GROUND_Y - player.h;
+        player.vx = player.vy = 0;
+      }
+    }
+  }
+
+  // ---- draw ----
+  function draw(){
+    // background gradient (autumn sky)
+    const g = ctx.createLinearGradient(0,0,0,H);
+    g.addColorStop(0,'#ffd7b3');
+    g.addColorStop(0.6,'#ffefdb');
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,W,H);
+
+    // distant mountains (red/orange)
+    for(let i=0;i<6;i++){
+      const mx = (i*600 - scrollX*0.2) % (STAGE_LENGTH+600);
+      ctx.fillStyle = i%2? '#b84a2a' : '#d96a3a';
+      ctx.beginPath();
+      ctx.moveTo(mx - 200, H);
+      ctx.lineTo(mx + 150, H - 180 - (i%2?20:0));
+      ctx.lineTo(mx + 500, H);
+      ctx.fill();
+    }
+
+    // leaves (background)
+    for(let lf of leaves){
+      const sx = lf.x - scrollX;
+      const sy = lf.y;
+      ctx.save();
+      ctx.translate(sx, sy);
+      ctx.rotate(lf.rot);
+      ctx.fillStyle = `rgba(220, ${80 + Math.round(lf.size)}, 30, 0.9)`;
+      ctx.fillRect(-lf.size/2, -lf.size/4, lf.size, lf.size/2);
+      ctx.restore();
+    }
+
+    // ground tiles
+    ctx.fillStyle = '#7f4a24';
+    for(let g of groundTiles){
+      const gx = g.x - scrollX;
+      if(gx + g.w < -100 || gx > W + 100) continue;
+      ctx.fillRect(gx, g.y, g.w, g.h);
+    }
+
+    // blocks
+    for(let b of blocks){
+      const bx = b.x - scrollX;
+      if(bx + b.w < -200 || bx > W + 200) continue;
+      if(b.type === '?'){
+        ctx.fillStyle = b.hit ? '#c87b3a' : '#ffd24d';
+      } else if(b.type === 'brick'){
+        ctx.fillStyle = '#a66a3a';
+      } else if(b.type === 'goal'){
+        ctx.fillStyle = '#2f7f2f';
+      } else {
+        ctx.fillStyle = '#8b5a3c';
+      }
+      ctx.fillRect(bx, b.y, b.w, b.h);
+      if(b.type === '?' && !b.hit){
+        ctx.fillStyle = '#8b5a3c';
+        ctx.font = '20px sans-serif';
+        ctx.fillText('?', bx + b.w/3, b.y + b.h - 10);
+      }
+    }
+
+    // items
+    for(let it of items){
+      const ix = it.x - scrollX;
+      if(ix + it.w < -100 || ix > W + 100) continue;
+      ctx.fillStyle = it.type === 'mushroom' ? '#c0392b' : '#3498db';
+      ctx.fillRect(ix, it.y, it.w, it.h);
+    }
+
+    // enemies
+    for(let e of enemies){
+      const ex = e.x - scrollX;
+      if(ex + e.w < -200 || ex > W + 200) continue;
+      ctx.fillStyle = '#2b2b2b';
+      ctx.fillRect(ex, e.y, e.w, e.h);
+    }
+
+    // player
+    const px = player.x - scrollX;
+    ctx.fillStyle = player.big ? '#ff8c42' : '#e74c3c';
+    ctx.fillRect(px, player.y, player.w, player.h);
+
+    // flag / goal animation
+    for(let b of blocks){
+      if(b.type === 'goal'){
+        const gx = b.x - scrollX;
+        ctx.fillStyle = '#663300';
+        ctx.fillRect(gx + 20, b.y - 140, 6, 140);
+        if(flagAnim.active){
+          flagAnim.t += 0.02;
+          const fy = b.y - 120 + Math.min(1, flagAnim.t) * 100;
+          ctx.fillStyle = '#ffcc00';
+          ctx.fillRect(gx + 26, fy, 40, 28);
+        } else {
+          ctx.fillStyle = '#ffcc00';
+          ctx.fillRect(gx + 26, b.y - 20, 40, 28);
+        }
+      }
+    }
+
+    // HUD
+    ctx.fillStyle = '#3b2b20';
+    ctx.font = '18px sans-serif';
+    ctx.fillText('LIVES: ' + lives, 12, 22);
+    ctx.fillText('SCORE: ' + score, 12, 44);
+    ctx.fillText('BIG: ' + (player.big ? 'YES' : 'NO'), 12, 66);
+
+    if(gameOver){
+      ctx.fillStyle = 'rgba(0,0,0,0.4)';
+      ctx.fillRect(0, H/2 - 40, W, 80);
+      ctx.fillStyle = 'white';
+      ctx.font = '36px sans-serif';
+      ctx.fillText('GAME OVER', W/2 - 110, H/2 + 12);
+    }
+    if(gameClear){
+      ctx.fillStyle = 'rgba(255,255,255,0.6)';
+      ctx.fillRect(0, H/2 - 60, W, 120);
+      ctx.fillStyle = '#7f3f00';
+      ctx.font = '36px serif';
+      ctx.fillText('🍁 STAGE CLEAR! 🍁', W/2 - 160, H/2 + 6);
+      ctx.font = '20px sans-serif';
+      ctx.fillText('Score: ' + score, W/2 - 40, H/2 + 36);
+    }
+  }
+
+  // main loop
+  function loop(){
+    update();
+    draw();
+    requestAnimationFrame(loop);
+  }
+  loop();
+
+})();
+</script>
+</body>
+</html>
